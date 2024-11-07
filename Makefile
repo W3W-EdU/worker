@@ -72,8 +72,14 @@ coverage.coverprofile: $(COVERPROFILES)
 	$(GO) tool cover -func=$@
 
 .PHONY: build
-build: .deps-fetched
+build: .deps-fetched watchdog
 	$(GO) install -tags netgo -ldflags "$(GOBUILD_LDFLAGS)" $(ALL_PACKAGES)
+
+.PHONY: watchdog
+watchdog:
+	pushd tools/lxd_watchdog && \
+	$(GO) install . && \
+	popd
 
 .PHONY: crossbuild
 crossbuild: .deps-fetched $(CROSSBUILD_BINARIES)

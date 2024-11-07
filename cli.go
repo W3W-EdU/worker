@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -143,6 +144,9 @@ func (i *CLI) Setup() (bool, error) {
 
 	logger.WithField("cfg", fmt.Sprintf("%#v", i.Config)).Debug("read config")
 
+	i.checkIfCanRun()
+	i.writePid()
+
 	i.setupSentry()
 	i.setupMetrics()
 
@@ -263,6 +267,28 @@ func (i *CLI) Run() {
 			i.logger.WithField("err", err).Error("couldn't clean up logs queue")
 		}
 	}
+}
+
+func (i *CLI) checkIfCanRun() {
+	file, err := os.Open("/tmp/worker.lock")
+	if err == nil {
+
+		file.Close()
+		i.logger.WithField("err", err).Error("/tmp/worker.lock exists, not running!")
+		os.Exit(-11)
+	}
+
+}
+
+func (i *CLI) writePid() {
+	file, err := os.Create("/tmp/worker.pid")
+	if err != nil {
+		i.logger.WithField("err", err).Error("failed to write worker pid")
+		return
+	}
+	defer file.Close()
+
+	file.WriteString(strconv.Itoa(os.Getpid()))
 }
 
 func (i *CLI) setupHeartbeat() {
