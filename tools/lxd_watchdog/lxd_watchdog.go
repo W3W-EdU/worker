@@ -15,7 +15,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -146,11 +145,37 @@ func newLxdWatchdog() (*lxdWatchdog, error) {
 	}, nil
 }
 
+func (p *lxdWatchdog) getInstancesIps() []string {
+	result := []string{}
+	instances, err := p.client.GetInstances(lxdapi.InstanceTypeAny)
+	if err != nil {
+		fmt.Printf("Error on getting instances: %v\n", err)
+		return result
+	}
+	for _, i := range instances {
+		state, _, err := p.client.GetInstanceState(i.Name)
+		if err != nil {
+			fmt.Printf("Error on getting instance state: %v\n", err)
+			return result
+		}
+		net := state.Network["eth0"]
+		for _, addr := range net.Addresses {
+			if addr.Family == "inet" {
+				result = append(result, addr.Address)
+			}
+
+		}
+
+	}
+	return result
+}
+
 func (p *lxdWatchdog) allocateAddress(containerName string) (string, error) {
 	p.networkLeasesLock.Lock()
 	defer p.networkLeasesLock.Unlock()
 
-	// Get all IPs
+	reservedIps := p.getInstancesIps()
+
 	inc := func(ip net.IP) {
 		for j := len(ip) - 1; j >= 0; j-- {
 			ip[j]++
@@ -173,13 +198,19 @@ func (p *lxdWatchdog) allocateAddress(containerName string) (string, error) {
 	var ips []string
 	ip := net.ParseIP(p.networkGateway)
 	for ip := ip.Mask(p.networkSubnet.Mask); p.networkSubnet.Contains(ip); inc(ip) {
-		ips = append(ips, ip.String())
+		if ip[3] >= 230 {
+			ips = append(ips, ip.String())
+		}
 	}
 
 	usedIPs := []string{}
 	for _, usedIP := range p.networkLeases {
 		usedIPs = append(usedIPs, usedIP)
 	}
+
+	usedIPs = append(usedIPs, reservedIps...)
+
+	fmt.Printf("usedIPs: %v\n", usedIPs)
 
 	// Find a free address
 	for _, ip := range ips {
@@ -200,6 +231,7 @@ func (p *lxdWatchdog) allocateAddress(containerName string) (string, error) {
 			continue
 		}
 
+		fmt.Printf("FREE ADDRESS: %v\n", ip)
 		// Allocate the address
 		p.networkLeases[containerName] = ip
 		size, _ := p.networkSubnet.Mask.Size()
@@ -373,26 +405,16 @@ func (p *lxdWatchdog) Start() error {
 			return err
 		}
 
-		dns, err := json.Marshal(p.networkDNS)
-		if err != nil {
-			return err
-		}
-
 		container.Devices["eth0"]["ipv4.address"] = strings.Split(address, "/")[0]
 
 		var fileName, content string
-		fileName = "/etc/netplan/50-cloud-init.yaml"
-		content = fmt.Sprintf(`network:
-            version: 2
-            ethernets:
-            eth0:
-            addresses:
-            - %s
-            gateway4: %s
-            nameservers:
-            addresses: %s
-            mtu: %s
-            `, address, p.networkGateway, dns, p.networkMTU)
+		fileName = "/etc/network/interfaces"
+		content = fmt.Sprintf(`auto eth0		
+iface eth0 inet static
+  address %s
+  gateway: %s
+  netmask: 255.255.255.0
+`, strings.Split(address, "/")[0], p.networkGateway)
 
 		args := lxd.InstanceFileArgs{
 			Type:    "file",
@@ -404,7 +426,26 @@ func (p *lxdWatchdog) Start() error {
 
 		err = p.client.CreateInstanceFile(containerName, fileName, args)
 		if err != nil {
-			return fmt.Errorf("failed to upload netplan/interfaces to container: %v", err)
+			fmt.Printf("failed to upload network/interfaces to container: %v\n", err)
+		}
+
+		fileName = "/etc/resolv.conf"
+		content = fmt.Sprintf("search lxd\nnameserver %s\n", p.networkGateway)
+		for _, d := range p.networkDNS {
+			content = fmt.Sprintf("%snameserver %s\n", content, d)
+		}
+
+		args = lxd.InstanceFileArgs{
+			Type:    "file",
+			Mode:    0644,
+			UID:     0,
+			GID:     0,
+			Content: strings.NewReader(string(content)),
+		}
+
+		err = p.client.CreateInstanceFile(containerName, fileName, args)
+		if err != nil {
+			fmt.Printf("failed to upload resolv.conf to container: %v\n", err)
 		}
 	}
 
@@ -432,6 +473,18 @@ func (p *lxdWatchdog) Start() error {
 	}
 
 	fmt.Printf("STARTED - check connection\n")
+
+	if p.networkStatic {
+		exec := lxdapi.InstanceExecPost{
+			Command: []string{"route", "add", "default", "gw", "_gateway.lxd"},
+		}
+
+		// Spawn the command
+		_, err = p.client.ExecInstance(containerName, exec, nil)
+		if err != nil {
+			fmt.Printf("couldn't add default gateway: %v\n", err)
+		}
+	}
 
 	// Wait for connectivity
 	connectivityCheck := func() error {
@@ -465,7 +518,7 @@ func (p *lxdWatchdog) Start() error {
 		if err == nil {
 			break
 		}
-		//fmt.Printf("wait for connection\n")
+		fmt.Printf("wait for connection\n")
 
 		time.Sleep(500 * time.Millisecond)
 	}
