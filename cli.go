@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -144,11 +143,19 @@ func (i *CLI) Setup() (bool, error) {
 
 	logger.WithField("cfg", fmt.Sprintf("%#v", i.Config)).Debug("read config")
 
-	i.checkIfCanRun()
-	i.writePid()
-
 	i.setupSentry()
 	i.setupMetrics()
+	if i.Config.ProviderName == "lxd" { // run watchdog once to check if containers start and get network connection - exits if not
+		RunLXDWatchdog(false)
+
+		if i.c.Bool("watchdog") {
+			os.Exit(0) // don't proceed if running with '-watchdog' param
+		}
+	}
+
+	if i.Config.ProviderName == "lxd" {
+		RunLXDWatchdog(true) // start the ldx watchdog loop
+	}
 
 	err := i.setupOpenCensus(ctx)
 	if err != nil {
@@ -267,28 +274,6 @@ func (i *CLI) Run() {
 			i.logger.WithField("err", err).Error("couldn't clean up logs queue")
 		}
 	}
-}
-
-func (i *CLI) checkIfCanRun() {
-	file, err := os.Open("/tmp/worker.lock")
-	if err == nil {
-
-		file.Close()
-		i.logger.WithField("err", err).Error("/tmp/worker.lock exists, not running!")
-		os.Exit(-11)
-	}
-
-}
-
-func (i *CLI) writePid() {
-	file, err := os.Create("/tmp/worker.pid")
-	if err != nil {
-		i.logger.WithField("err", err).Error("failed to write worker pid")
-		return
-	}
-	defer file.Close()
-
-	file.WriteString(strconv.Itoa(os.Getpid()))
 }
 
 func (i *CLI) setupHeartbeat() {

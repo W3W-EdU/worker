@@ -1,4 +1,4 @@
-package main
+package worker
 
 // worker watchdog - performs basic checks for worker lxd backend
 // runs as a single check or a loop with '-l' or '--loop' parameters
@@ -15,7 +15,6 @@ package main
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -43,12 +42,13 @@ type lxdWatchdog struct {
 	networkLeasesLock sync.Mutex
 
 	httpProxy, httpsProxy, ftpProxy, noProxy string
+	lastSleep                                int
 }
 
 func newLxdWatchdog() (*lxdWatchdog, error) {
 	client, err := lxd.ConnectLXDUnix("", nil)
 	if err != nil {
-		fmt.Printf("can't connect lxd: %v\n", err)
+		fmt.Printf("[LXDWATCHDOG] can't connect lxd: %v\n", err)
 		return nil, err
 	}
 
@@ -142,6 +142,7 @@ func newLxdWatchdog() (*lxdWatchdog, error) {
 		httpsProxy: httpsProxy,
 		ftpProxy:   ftpProxy,
 		noProxy:    noProxy,
+		lastSleep:  0,
 	}, nil
 }
 
@@ -149,13 +150,13 @@ func (p *lxdWatchdog) getInstancesIps() []string {
 	result := []string{}
 	instances, err := p.client.GetInstances(lxdapi.InstanceTypeAny)
 	if err != nil {
-		fmt.Printf("Error on getting instances: %v\n", err)
+		fmt.Printf("[LXDWATCHDOG] Error on getting instances: %v\n", err)
 		return result
 	}
 	for _, i := range instances {
 		state, _, err := p.client.GetInstanceState(i.Name)
 		if err != nil {
-			fmt.Printf("Error on getting instance state: %v\n", err)
+			fmt.Printf("[LXDWATCHDOG] Error on getting instance state: %v\n", err)
 			return result
 		}
 		net := state.Network["eth0"]
@@ -210,8 +211,6 @@ func (p *lxdWatchdog) allocateAddress(containerName string) (string, error) {
 
 	usedIPs = append(usedIPs, reservedIps...)
 
-	fmt.Printf("usedIPs: %v\n", usedIPs)
-
 	// Find a free address
 	for _, ip := range ips {
 		// Skip used addresses
@@ -231,7 +230,7 @@ func (p *lxdWatchdog) allocateAddress(containerName string) (string, error) {
 			continue
 		}
 
-		fmt.Printf("FREE ADDRESS: %v\n", ip)
+		fmt.Printf("[LXDWATCHDOG] FREE ADDRESS: %v\n", ip)
 		// Allocate the address
 		p.networkLeases[containerName] = ip
 		size, _ := p.networkSubnet.Mask.Size()
@@ -295,7 +294,7 @@ func (p *lxdWatchdog) getImage(imageName string) (lxd.ImageServer, *lxdapi.Image
 	return p.client, image, nil
 }
 
-func (p *lxdWatchdog) Start() error {
+func (p *lxdWatchdog) Start(singleRun bool) error {
 
 	var (
 		err error
@@ -309,7 +308,7 @@ func (p *lxdWatchdog) Start() error {
 
 	imageServer, image, err := p.getImage(imageName)
 	if err != nil {
-		fmt.Printf("Error getting image: %v\n", err)
+		fmt.Printf("[LXDWATCHDOG] Error getting image: %v\n", err)
 		return err
 	}
 
@@ -348,7 +347,7 @@ func (p *lxdWatchdog) Start() error {
 			p.releaseAddress(containerName)
 		}
 
-		fmt.Printf("removed preexisting container before create\n")
+		fmt.Printf("[LXDWATCHDOG] removed preexisting container before create\n")
 	}
 
 	// Create the container
@@ -445,7 +444,7 @@ iface eth0 inet static
 
 		err = p.client.CreateInstanceFile(containerName, fileName, args)
 		if err != nil {
-			fmt.Printf("failed to upload resolv.conf to container: %v\n", err)
+			fmt.Printf("[LXDWATCHDOG] failed to upload resolv.conf to container: %v\n", err)
 		}
 	}
 
@@ -482,7 +481,7 @@ iface eth0 inet static
 		// Spawn the command
 		_, err = p.client.ExecInstance(containerName, exec, nil)
 		if err != nil {
-			fmt.Printf("couldn't add default gateway: %v\n", err)
+			fmt.Printf("[LXDWATCHDOG] couldn't add default gateway: %v\n", err)
 		}
 	}
 
@@ -518,23 +517,21 @@ iface eth0 inet static
 		if err == nil {
 			break
 		}
-		fmt.Printf("wait for connection\n")
+		fmt.Printf("[LXDWATCHDOG] wait for connection\n")
 
 		time.Sleep(500 * time.Millisecond)
 	}
 
 	if err != nil {
-		fmt.Printf("container didn't have connectivity after 30s: %v\n", err)
-		err = p.killWorker()
+		fmt.Printf("[LXDWATCHDOG] container didn't have connectivity after 30s: %v\n", err)
+		err = p.killWorker(singleRun)
 		if err != nil {
 			fmt.Printf("kill worker error: %v\n", err)
 		}
 
 		p.datadogAlert("[TRAVIS][LXC] Watchdog error", "container didn't have connectivity after 30s")
 	}
-	fmt.Printf("STARTED - OK\n")
-
-	p.setWorkerLock(false)
+	fmt.Printf("[LXDWATCHDOG] STARTED - OK\n")
 
 	// Get the container
 	container, _, err = p.client.GetInstance(containerName)
@@ -577,54 +574,25 @@ iface eth0 inet static
 		p.releaseAddress(container.Name)
 	}
 
-	fmt.Printf("CLEANUP DONE\n")
-	return nil
-}
-func (p *lxdWatchdog) setWorkerLock(value bool) error {
-	if value {
-		file, err := os.Create("/tmp/worker.lock")
-		if err != nil {
-			return fmt.Errorf("can't set the worker lock, can't access the worker.lock file: %v", err)
-		}
-		defer file.Close()
-		_, err = file.Write([]byte{'1'})
-		if err != nil {
-			return fmt.Errorf("can't set the worker lock, can't write the worker.lock file: %v", err)
-		}
-	} else {
-		err := os.Remove("/tmp/worker.lock")
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-
-			return fmt.Errorf("can't remove the worker lock!: %v", err)
-		}
-		if err != nil {
-			fmt.Printf("Skipping remove lock, doesn't exist\n")
-		}
-	}
+	fmt.Printf("[LXDWATCHDOG] CLEANUP DONE\n")
 	return nil
 }
 
-func (p *lxdWatchdog) killWorker() error {
-	file, err := os.Open("/tmp/worker.pid")
-	if err != nil {
-		return fmt.Errorf("can't kill the worker, can't access the worker.pid file: %v", err)
-	}
-	defer file.Close()
-	data := make([]byte, 64)
+func (p *lxdWatchdog) killWorker(singleRun bool) error {
+	if singleRun {
+		fmt.Printf("[LXDWATCHDOG] Can't reach network from LXD watchdog killing the worker")
+		if p.lastSleep == 0 {
+			p.lastSleep = 1
+		} else {
+			p.lastSleep *= 2
+		}
 
-	var count int = 0
-	count, err = file.Read(data)
-	if err != nil {
-		return fmt.Errorf("can't kill the worker, can't read the worker.pid file: %v", err)
+		p.setStartInterval(p.lastSleep)
+		os.Exit(-1)
 	}
-	pid := 0
-	pid, err = strconv.Atoi(string(data[:count]))
-	if err != nil || pid == 0 {
-		return fmt.Errorf("can't kill the worker, can't read the worker.pid : %v", err)
-	}
-	p.setWorkerLock(true)
-	syscall.Kill(pid, syscall.SIGTERM)
-	fmt.Printf("Sent SIGTERM to worker process [%d]\n", pid)
+	pid := os.Getpid()
+	syscall.Kill(pid, syscall.SIGUSR2)
+	fmt.Printf("[LXDWATCHDOG] Sent SIGUSR2 to worker process [%d]\n", pid)
 	return nil
 }
 
@@ -642,42 +610,88 @@ func (p *lxdWatchdog) datadogAlert(title string, text string) {
 	}
 	r, err := http.NewRequest("POST", url, bytes.NewBufferString(content))
 	if err != nil {
-		fmt.Printf("ERROR on creating request for Datadog: %v\n", err)
+		fmt.Printf("[LXDWATCHDOG] ERROR on creating request for Datadog: %v\n", err)
 	}
 	r.Header.Add("Content-Type", "application/json")
 
 	client := &http.Client{}
 	_, err = client.Do(r)
 	if err != nil {
-		fmt.Printf("ERROR on sending request to Datadog: %v\n", err)
+		fmt.Printf("[LXDWATCHDOG] ERROR on sending request to Datadog: %v\n", err)
 	}
 }
 
-func main() {
-	args := os.Args
-	loop := false
-	sleepTime := 60 * time.Minute
-	if len(args) > 1 && (args[1] == "-l" || args[1] == "--loop") {
-		loop = true
-		sleepStr := os.Getenv("WATCHDOG_INTERVAL")
-		if sleepStr != "" {
+func (p *lxdWatchdog) setStartInterval(interval int) error {
+	file, err := os.Create("/tmp/ldx_watchdog.interval")
+	if err != nil {
+		return fmt.Errorf("can't set the worker lock, can't access the worker.lock file: %v", err)
+	}
+	defer file.Close()
+	_, err = file.WriteString(strconv.Itoa(interval))
+	if err != nil {
+		return fmt.Errorf("can't set the worker lock, can't write the worker.lock file: %v", err)
+	}
 
-			t, err := strconv.Atoi(sleepStr)
-			if err == nil {
-				sleepTime = time.Duration(t) * time.Minute
-			}
+	return nil
+}
+
+func (p *lxdWatchdog) getStartInterval() int {
+	defaultInterval := 0
+	file, err := os.Open("/tmp/ldx_watchdog.interval")
+	if err != nil {
+		return defaultInterval
+	}
+	defer file.Close()
+	data := make([]byte, 64)
+
+	var count int = 0
+	count, err = file.Read(data)
+	if err != nil {
+		return defaultInterval
+	}
+	interval := 0
+	interval, err = strconv.Atoi(string(data[:count]))
+	if err != nil || interval == 0 {
+		return defaultInterval
+	}
+	return interval
+}
+
+func (p *lxdWatchdog) handleSleep() {
+	sleepTime := 60 * time.Minute
+
+	t := p.getStartInterval()
+	if t > 0 {
+		sleepTime = time.Duration(p.getStartInterval()) * time.Minute
+		p.lastSleep = t
+		fmt.Printf("[LXDWATCHDOG] last run was unsuccessful waiting for %d minutes before retry\n", t)
+		time.Sleep(sleepTime)
+	}
+}
+
+func watchdogMain(loop bool) {
+	sleepTime := 60 * time.Minute
+	sleepStr := os.Getenv("WATCHDOG_INTERVAL")
+	if sleepStr != "" {
+
+		t, err := strconv.Atoi(sleepStr)
+		if err == nil {
+			sleepTime = time.Duration(t) * time.Minute
 		}
 	}
-	fmt.Println("Starting LXD watchdog")
+	fmt.Println("[LXDWATCHDOG] Starting LXD watchdog")
 	w, err := newLxdWatchdog()
+	if !loop {
+		w.handleSleep()
+	}
 	for {
 		if err == nil {
-			err = w.Start()
+			err = w.Start(!loop)
 			if err != nil {
-				fmt.Printf("error on start: %v\n", err)
+				fmt.Printf("[LXDWATCHDOG] error on start: %v\n", err)
 			}
 		} else {
-			fmt.Printf("Starting LXD watchdog error: %v\n", err)
+			fmt.Printf("[LXDWATCHDOG] Starting LXD watchdog error: %v\n", err)
 		}
 		if !loop {
 			break
@@ -685,5 +699,14 @@ func main() {
 		err = nil
 
 		time.Sleep(sleepTime)
+	}
+}
+
+func RunLXDWatchdog(loop bool) {
+
+	if loop {
+		go watchdogMain(true)
+	} else {
+		watchdogMain(false)
 	}
 }

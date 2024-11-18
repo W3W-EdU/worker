@@ -280,6 +280,9 @@ var (
 			Usage: "sample rate for trace as an inverse fraction - for sample rate n, every nth event will be sampled",
 			Value: 1,
 		}),
+		NewConfigDef("watchdog", &cli.BoolFlag{
+			Usage: "execute LXD watchdog and exit",
+		}),
 	}
 
 	// Flags is the list of all CLI flags accepted by travis-worker
