@@ -6,7 +6,7 @@ WORKDIR /go/src/github.com/travis-ci/worker
 ENV CGO_ENABLED 0
 RUN make build
 
-FROM alpine:latest
+FROM alpine:3.23.3
 RUN apk --no-cache add ca-certificates curl bash
 
 COPY --from=builder /go/bin/travis-worker /usr/local/bin/travis-worker
